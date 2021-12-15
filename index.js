@@ -2,12 +2,12 @@ var AWS = require('aws-sdk');
 var url = require('url');
 var https = require('https');
 var config = require('./config');
-var _ = require('lodash');
-var hookUrl;
+var notificationHookUrl;
+var pipelineHookUrl;
 
 var baseSlackMessage = {}
 
-var postMessage = function(message, callback) {
+var postMessage = function(hookUrl, message, callback) {
   var body = JSON.stringify(message);
   var options = url.parse(hookUrl);
   options.method = 'POST';
@@ -84,7 +84,7 @@ var handleElasticBeanstalk = function(event, context) {
     ]
   };
 
-  return _.merge(slackMessage, baseSlackMessage);
+  return { ...slackMessage, ...baseSlackMessage };
 };
 
 var handleCodeDeploy = function(event, context) {
@@ -131,7 +131,7 @@ var handleCodeDeploy = function(event, context) {
     ]
   };
 
-  return _.merge(slackMessage, baseSlackMessage);
+  return { ...slackMessage, ...baseSlackMessage };
 };
 
 var handleCodePipeline = function(event, context) {
@@ -145,7 +145,7 @@ var handleCodePipeline = function(event, context) {
 
   try {
     message = JSON.parse(event.Records[0].Sns.Message);
-    detailType = message['detail-type'];
+    detailType = message['detailType'];
 
     if(detailType === "CodePipeline Pipeline Execution State Change"){
       changeType = "";
@@ -190,7 +190,7 @@ var handleCodePipeline = function(event, context) {
     ]
   };
 
-  return _.merge(slackMessage, baseSlackMessage);
+  return { ...slackMessage, ...baseSlackMessage };
 };
 
 var handleElasticache = function(event, context) {
@@ -224,7 +224,7 @@ var handleElasticache = function(event, context) {
       }
     ]
   };
-  return _.merge(slackMessage, baseSlackMessage);
+  return { ...slackMessage, ...baseSlackMessage };
 };
 
 var handleCloudWatch = function(event, context) {
@@ -277,7 +277,7 @@ var handleCloudWatch = function(event, context) {
       }
     ]
   };
-  return _.merge(slackMessage, baseSlackMessage);
+  return { ...slackMessage, ...baseSlackMessage };
 };
 
 var handleAutoScaling = function(event, context) {
@@ -308,7 +308,7 @@ var handleAutoScaling = function(event, context) {
       }
     ]
   };
-  return _.merge(slackMessage, baseSlackMessage);
+  return { ...slackMessage, ...baseSlackMessage };
 };
 
 var handleCatchAll = function(event, context) {
@@ -350,7 +350,7 @@ var handleCatchAll = function(event, context) {
         ]
     }
 
-  return _.merge(slackMessage, baseSlackMessage);
+  return { ...slackMessage, ...baseSlackMessage };
 }
 
 var processEvent = function(event, context) {
@@ -360,6 +360,7 @@ var processEvent = function(event, context) {
   var eventSnsSubject = event.Records[0].Sns.Subject || 'no subject';
   var eventSnsMessageRaw = event.Records[0].Sns.Message;
   var eventSnsMessage = null;
+  var hookUrl = notificationHookUrl;
 
   try {
     eventSnsMessage = JSON.parse(eventSnsMessageRaw);
@@ -370,12 +371,17 @@ var processEvent = function(event, context) {
   if(eventSubscriptionArn.indexOf(config.services.codepipeline.match_text) > -1 || eventSnsSubject.indexOf(config.services.codepipeline.match_text) > -1 || eventSnsMessageRaw.indexOf(config.services.codepipeline.match_text) > -1){
     console.log("processing codepipeline notification");
     slackMessage = handleCodePipeline(event,context)
+    hookUrl = pipelineHookUrl;
   }
   else if(eventSubscriptionArn.indexOf(config.services.elasticbeanstalk.match_text) > -1 || eventSnsSubject.indexOf(config.services.elasticbeanstalk.match_text) > -1 || eventSnsMessageRaw.indexOf(config.services.elasticbeanstalk.match_text) > -1){
     console.log("processing elasticbeanstalk notification");
     slackMessage = handleElasticBeanstalk(event,context)
   }
   else if(eventSnsMessage && 'AlarmName' in eventSnsMessage && 'AlarmDescription' in eventSnsMessage){
+    if (eventSnsMessage.OldStateValue === 'INSUFFICIENT_DATA') {
+      return;
+    }
+
     console.log("processing cloudwatch notification");
     slackMessage = handleCloudWatch(event,context);
   }
@@ -395,7 +401,7 @@ var processEvent = function(event, context) {
     slackMessage = handleCatchAll(event, context);
   }
 
-  postMessage(slackMessage, function(response) {
+  postMessage(hookUrl, slackMessage, function(response) {
     if (response.statusCode < 400) {
       console.info('message posted successfully');
       context.succeed();
@@ -411,26 +417,43 @@ var processEvent = function(event, context) {
 };
 
 exports.handler = function(event, context) {
-  if (hookUrl) {
+  if (notificationHookUrl && pipelineHookUrl) {
     processEvent(event, context);
-  } else if (config.unencryptedHookUrl) {
-    hookUrl = config.unencryptedHookUrl;
-    processEvent(event, context);
-  } else if (config.kmsEncryptedHookUrl && config.kmsEncryptedHookUrl !== '<kmsEncryptedHookUrl>') {
-    var encryptedBuf = new Buffer(config.kmsEncryptedHookUrl, 'base64');
-    var cipherText = { CiphertextBlob: encryptedBuf };
-    var kms = new AWS.KMS();
+  } else {
+    var secretName = config.secretArn;
+    var client = new AWS.SecretsManager({
+      region: 'us-east-1'
+    });
 
-    kms.decrypt(cipherText, function(err, data) {
+    client.getSecretValue({SecretId: secretName}, function(err, data) {
       if (err) {
-        console.log("decrypt error: " + err);
-        processEvent(event, context);
-      } else {
-        hookUrl = "https://" + data.Plaintext.toString('ascii');
+          if (err.code === 'DecryptionFailureException')
+              // Secrets Manager can't decrypt the protected secret text using the provided KMS key.
+              // Deal with the exception here, and/or rethrow at your discretion.
+              throw err;
+          else if (err.code === 'InternalServiceErrorException')
+              // An error occurred on the server side.
+              // Deal with the exception here, and/or rethrow at your discretion.
+              throw err;
+          else if (err.code === 'InvalidParameterException')
+              // You provided an invalid value for a parameter.
+              // Deal with the exception here, and/or rethrow at your discretion.
+              throw err;
+          else if (err.code === 'InvalidRequestException')
+              // You provided a parameter value that is not valid for the current state of the resource.
+              // Deal with the exception here, and/or rethrow at your discretion.
+              throw err;
+          else if (err.code === 'ResourceNotFoundException')
+              // We can't find the resource that you asked for.
+              // Deal with the exception here, and/or rethrow at your discretion.
+              throw err;
+      }
+      else {
+        var secretJSON = JSON.parse(data.SecretString);
+        notificationHookUrl = secretJSON['SLACK_NOTIFICATION_WEBHOOK_URL'];
+        pipelineHookUrl = secretJSON['SLACK_PIPELINE_WEBHOOK_URL'];
         processEvent(event, context);
       }
     });
-  } else {
-    context.fail('hook url has not been set.');
   }
 };

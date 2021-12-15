@@ -1,7 +1,5 @@
 module.exports = {
-  kmsEncryptedHookUrl: process.env.KMS_ENCRYPTED_HOOK_URL, // encrypted slack webhook url
-  unencryptedHookUrl: process.env.UNENCRYPTED_HOOK_URL,    // unencrypted slack webhook url
-
+  secretArn: process.env.SECRET_ARN, // secret containing the webhook
   services: {
     elasticbeanstalk: {
       // text in the sns message or topicname to match on to process this service type
@@ -11,7 +9,7 @@ module.exports = {
     },
     codepipeline: {
       // text in the sns message or topicname to match on to process this service type
-      match_text: "CodePipelineNotifications"
+      match_text: "CodePipeline Pipeline Execution"
     },
     codedeploy: {
       // text in the sns message or topicname to match on to process this service type
